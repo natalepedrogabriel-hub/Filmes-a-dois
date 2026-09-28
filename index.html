@@ -343,6 +343,104 @@
     try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch {}
   }
 
+  // ---------- Sincronia entre celulares (Firebase Realtime Database via REST) ----------
+  // config.js define window.SYNC_URL = 'https://SEU-PROJETO-default-rtdb.firebaseio.com'
+  const SYNC_BASE = window.SYNC_URL ? String(window.SYNC_URL).replace(/\/+$/, '') + '/filmes-a-dois' : '';
+  const mkey = id => 'm' + id; // chaves não numéricas evitam que o Firebase converta em array
+
+  async function remote(method, path, body) {
+    if (!SYNC_BASE) return null;
+    try {
+      const res = await fetch(`${SYNC_BASE}${path}.json`, {
+        method, headers: { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    } catch (e) {
+      syncFailed();
+      return null;
+    }
+  }
+  let failNotified = false;
+  function syncFailed() {
+    if (failNotified) return;
+    failNotified = true;
+    toast('Sem conexão com a lista do casal. As mudanças ficam só neste celular por enquanto.');
+  }
+  const pushMovie = m => remote('PUT', '/movies/' + mkey(m.id), m);
+  const dropMovie = id => remote('DELETE', '/movies/' + mkey(id));
+  const pushPrefs = () => {
+    const { apiKey, ...shared } = state.prefs;
+    return remote('PUT', '/prefs', shared);
+  };
+
+  // Junta o que está no servidor com o que está neste celular (vence a mudança mais recente)
+  function applyRemote(data) {
+    if (!data) return;
+    const d = defaults();
+    if (data.prefs) state.prefs = { ...d.prefs, ...data.prefs, apiKey: state.prefs.apiKey };
+    const incoming = {};
+    for (const m of Object.values(data.movies || {})) if (m && m.id) incoming[m.id] = { genres: [], ...m };
+    for (const [id, m] of Object.entries(incoming)) {
+      const mine = state.movies[id];
+      if (!mine || (m.upd || m.at || 0) >= (mine.upd || mine.at || 0)) state.movies[id] = m;
+    }
+    // filmes apagados em outro celular (desfazer)
+    // (ignora os recém-criados aqui, que podem ainda não ter chegado ao servidor)
+    for (const [id, m] of Object.entries(state.movies))
+      if (!incoming[id] && m.synced && Date.now() - (m.upd || m.at || 0) > 15000) delete state.movies[id];
+    for (const m of Object.values(state.movies)) m.synced = true;
+    save();
+  }
+
+  async function syncStart() {
+    if (!SYNC_BASE) return;
+    const data = await remote('GET', '');
+    if (data === null && failNotified) return;
+    const had = data || {};
+    had.movies = had.movies || {};
+    // envia o que só existe aqui (primeiro uso da sincronia)
+    for (const m of Object.values(state.movies)) {
+      const r = had.movies[mkey(m.id)];
+      if (!r || (m.upd || m.at || 0) > (r.upd || r.at || 0)) {
+        m.synced = true; pushMovie(m); had.movies[mkey(m.id)] = m;
+      }
+    }
+    if (!had.prefs && state.prefs.configured) pushPrefs();
+    applyRemote(had);
+    refreshViews();
+    listen();
+  }
+
+  // Atualização ao vivo: o Firebase envia eventos (Server-Sent Events) quando algo muda
+  let refetchTimer;
+  function listen() {
+    if (!window.EventSource) return;
+    const es = new EventSource(SYNC_BASE + '.json');
+    const onChange = () => {
+      clearTimeout(refetchTimer);
+      refetchTimer = setTimeout(async () => {
+        const data = await remote('GET', '');
+        if (data) { applyRemote(data); refreshViews(); }
+      }, 400);
+    };
+    es.addEventListener('put', onChange);
+    es.addEventListener('patch', onChange);
+  }
+
+  function refreshViews() {
+    updateBadge();
+    if (current === 'library') renderLibrary();
+    if (current === 'couple') renderCouple();
+    if (current === 'feed') {
+      const before = queue.length;
+      queue = queue.filter(m => !state.movies[m.id]);
+      if (queue.length !== before || !queue.length) ensureFeed();
+    }
+    if (current === 'profile' && !profileTouched) renderProfile();
+  }
+
   // ---------- Utilidades ----------
   const $ = (s, el = document) => el.querySelector(s);
   const $$ = (s, el = document) => [...el.querySelectorAll(s)];
@@ -371,7 +469,9 @@
   }
 
   // ---------- Navegação ----------
+  let current = '';
   function show(view) {
+    current = view;
     $$('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + view));
     $$('nav.bottom button').forEach(b => b.classList.toggle('active', b.dataset.view === view));
     if (view === 'library') renderLibrary();
@@ -383,11 +483,13 @@
   $$('nav.bottom button').forEach(b => b.addEventListener('click', () => show(b.dataset.view)));
 
   // ---------- Perfil ----------
-  let draft;
+  let draft, profileTouched = false;
   function renderProfile() {
+    profileTouched = false;
     draft = JSON.parse(JSON.stringify(state.prefs));
     paintProfile();
   }
+  $('#view-profile').addEventListener('click', e => { if (e.target.closest('button, input')) profileTouched = true; });
   function paintProfile() {
     $('#genre-chips').innerHTML = GENRES.map(([id, name]) =>
       `<button class="chip ${draft.genres.includes(id) ? 'on' : ''}" data-g="${id}">${name}</button>`).join('');
@@ -438,7 +540,8 @@
   $('#save-prefs').addEventListener('click', () => {
     draft.configured = true;
     state.prefs = draft;
-    save();
+    profileTouched = false;
+    save(); pushPrefs();
     resetQueue();
     toast('Preferências salvas!');
     show('feed');
@@ -525,7 +628,7 @@
         state.feed.totalPages = data.total_pages || 1;
         state.feed.page++;
         for (const r of data.results || []) {
-          if (state.seen.includes(r.id) || queued.has(r.id)) continue;
+          if (state.seen.includes(r.id) || state.movies[r.id] || queued.has(r.id)) continue;
           if (state.prefs.origin === 'internacional' && r.original_language === 'pt') continue;
           if (!r.poster_path) continue;
           queued.add(r.id);
@@ -625,7 +728,8 @@
     wbtn.addEventListener('click', e => {
       e.stopPropagation();
       movie._watched = !movie._watched;
-      if (state.movies[movie.id]) { state.movies[movie.id].watched = movie._watched; save(); }
+      const saved = state.movies[movie.id];
+      if (saved) { saved.watched = movie._watched; saved.upd = Date.now(); save(); pushMovie(saved); }
       wbtn.classList.toggle('on', movie._watched);
       wbtn.textContent = movie._watched ? '✓ Já assisti' : '👁 Já assisti?';
     });
@@ -683,10 +787,10 @@
     state.movies[m.id] = {
       id: m.id, title: m.title, poster: m.poster, overview: m.overview, year: m.year,
       rating: m.rating, genres: m.genres, link: m.link || null,
-      liked, watched: !!m._watched, star: prev?.star || false, at: Date.now()
+      liked, watched: !!m._watched, star: prev?.star || false, at: Date.now(), upd: Date.now(), synced: true
     };
     if (!state.seen.includes(m.id)) state.seen.push(m.id);
-    save(); updateBadge();
+    save(); updateBadge(); pushMovie(state.movies[m.id]);
     if (liked) toast(m._watched ? '♥ Curtiu (já assistiu)' : '♥ Adicionado à lista do casal');
     renderDeck();
     if (queue.length < 3) loadMore();
@@ -697,7 +801,8 @@
   $('#btn-info').addEventListener('click', () => $('.card.front .overview')?.classList.toggle('open'));
   $('#btn-undo').addEventListener('click', () => {
     const h = history.pop(); if (!h) return;
-    if (h.prev) state.movies[h.movie.id] = h.prev; else delete state.movies[h.movie.id];
+    if (h.prev) { state.movies[h.movie.id] = { ...h.prev, upd: Date.now() }; pushMovie(state.movies[h.movie.id]); }
+    else { delete state.movies[h.movie.id]; dropMovie(h.movie.id); }
     state.seen = state.seen.filter(id => id !== h.movie.id);
     queue.unshift(h.movie); queued.add(h.movie.id);
     save(); updateBadge(); renderDeck();
@@ -757,7 +862,8 @@
     if (op === 'unlike') m.liked = false;
     if (op === 'like') m.liked = true;
     if (op === 'star') m.star = !m.star;
-    save(); updateBadge(); rerender();
+    m.upd = Date.now();
+    save(); updateBadge(); rerender(); pushMovie(m);
   }
   $('#lib-list').addEventListener('click', e => handleOps(e, renderLibrary));
   $('#couple-list').addEventListener('click', e => handleOps(e, renderCouple));
@@ -794,7 +900,8 @@
   // ---------- Início ----------
   updateBadge();
   show(state.prefs.configured ? 'feed' : 'profile');
-  if (!state.prefs.configured) toast('Bem-vinda! Conte do que você gosta 💕');
+  if (!state.prefs.configured && !SYNC_BASE) toast('Bem-vinda! Conte do que você gosta 💕');
+  syncStart().then(() => { if (current === 'profile' && state.prefs.configured && !profileTouched) show('feed'); });
 })();
 </script>
 </body>
